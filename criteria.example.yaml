@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# Targeting criteria. Copy to criteria.yaml and edit:  cp criteria.example.yaml criteria.yaml
+# Everything about WHO you're looking for lives here -- no code changes needed.
+# ---------------------------------------------------------------------------
+
+campaign_name: local-web-redesign
+
+# What you sell. The LLM uses this to judge fit and write the outreach opener.
+offer: >
+  Modern, mobile-friendly websites with online booking and local SEO for
+  small service businesses. Packages from $1,500.
+
+# Search queries ("cold search"). One pipeline pass runs every query.
+# Tips: combine a niche + location + a pain signal. Use search operators.
+queries:
+  - "plumber Austin TX family owned"
+  - "roofing contractor Austin TX \"call for a free estimate\""
+  - "hvac repair Round Rock TX"
+  # Other campaign ideas -- swap these in:
+  # - "site:reddit.com \"looking for\" CRM for small agency"
+  # - "\"we're hiring\" \"head of growth\" seed startup"
+  # - "\"best software for\" dental clinic scheduling forum"
+
+results_per_query: 10   # 1-50
+region: us-en           # DuckDuckGo region code (wt-wt = worldwide)
+
+# Ideal Customer Profile -- describe your perfect buyer in plain English.
+icp: >
+  An independent, owner-operated local service business (plumbing, HVAC,
+  roofing, electrical, landscaping) in the greater Austin, TX area with
+  roughly 3-50 employees. Their website is missing, outdated (old CMS,
+  no mobile layout, no HTTPS, copyright year several years old), or lacks
+  online booking. They show signs of being an established business that can
+  afford $1,500+ (multiple trucks/locations, years in business, good reviews).
+  NOT a franchise of a national chain, NOT a directory/aggregator listing,
+  NOT a web design agency.
+
+# Scoring rubric. The LLM scores each dimension 1-10; the overall score is the
+# weighted average. Keep names short -- they are used as JSON keys.
+rubric:
+  - name: relevance
+    weight: 3
+    description: How closely the prospect matches the ICP (industry, size, location, independent).
+  - name: pain_points
+    weight: 3
+    description: Visible evidence of the problem we solve (outdated/missing site, no mobile, no booking).
+  - name: budget_signals
+    weight: 2
+    description: Evidence they can pay (established, multiple staff/trucks, reviews, years in business).
+  - name: reachability
+    weight: 1
+    description: A direct contact path is visible (email, phone, contact form, named owner).
+
+min_score_to_save: 5    # below this a prospect is stored as 'rejected' (still blocks re-scoring)
+notify_threshold: 8     # score >= this triggers a ding
+
+# Never consider results from these domains (subdomains included).
+blocked_domains:
+  - yelp.com
+  - angi.com
+  - homeadvisor.com
+  - thumbtack.com
+  - bbb.org
+  - facebook.com
+  - yellowpages.com
+  - nextdoor.com
+  - mapquest.com
+  - wikipedia.org
+
+# Drop results whose title/snippet contains any of these (case-insensitive).
+exclude_keywords:
+  - "top 10"
+  - "best plumbers in"
+  - franchise opportunity

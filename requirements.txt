@@ -1,0 +1,9 @@
+requests>=2.32
+pydantic>=2.7
+python-dotenv>=1.0
+PyYAML>=6.0
+beautifulsoup4>=4.12
+ddgs>=9.0
+
+# dev / tests
+pytest>=8.0
