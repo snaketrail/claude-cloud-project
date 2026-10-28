@@ -1,4 +1,4 @@
-"""Lightweight SQLite storage with duplicate blocking by URL and by name.
+"""Lightweight SQLite storage with duplicate blocking by URL, domain and name.
 
 Every prospect that gets scored is stored -- including rejected ones -- so the
 pipeline never pays to score the same page twice and never dings you twice.
@@ -12,10 +12,12 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 from analyzer import LeadScore
-from searcher import Prospect
+from searcher import Prospect, domain_of
+
+STATUSES = ("rejected", "duplicate", "qualified", "notified", "contacted")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS leads (
@@ -27,7 +29,7 @@ CREATE TABLE IF NOT EXISTS leads (
     name_key         TEXT,
     query            TEXT,
     score            INTEGER,
-    status           TEXT NOT NULL DEFAULT 'new',  -- rejected | qualified | notified | contacted
+    status           TEXT NOT NULL,
     reasoning        TEXT,
     pain_points      TEXT,  -- JSON list
     budget_signals   TEXT,  -- JSON list
@@ -42,26 +44,43 @@ CREATE INDEX IF NOT EXISTS idx_leads_domain   ON leads(domain);
 CREATE INDEX IF NOT EXISTS idx_leads_status   ON leads(status);
 """
 
-_TRACKING_PARAMS = re.compile(r"^(utm_|fbclid|gclid|ref$|source$)")
+# Sites where many unrelated prospects share one domain; never dedupe by domain.
+PLATFORM_DOMAINS = {
+    "reddit.com", "linkedin.com", "x.com", "twitter.com", "facebook.com", "instagram.com",
+    "youtube.com", "medium.com", "substack.com", "quora.com", "github.com",
+    "stackoverflow.com", "stackexchange.com", "news.ycombinator.com", "producthunt.com",
+    "indeed.com", "glassdoor.com", "wellfound.com", "angel.co", "upwork.com",
+    "fiverr.com", "craigslist.org", "google.com", "sites.google.com", "wordpress.com",
+    "wixsite.com", "blogspot.com", "tumblr.com", "discord.com", "t.me",
+}
+
+_TRACKING_PARAM = re.compile(r"^(utm_.*|fbclid|gclid|msclkid|mc_[a-z]+|ref|ref_src|_ga|igshid)$", re.I)
 _NAME_NOISE = re.compile(
-    r"\b(inc|llc|ltd|limited|co|corp|corporation|company|gmbh|plc|the)\b\.?", re.I
+    r"\b(inc|llc|l\.l\.c|ltd|limited|co|corp|corporation|company|gmbh|plc|pty|the)\b\.?", re.I
 )
 
 
 def normalize_url(url: str) -> str:
     """Canonical form used for duplicate detection."""
     parsed = urlparse(url.strip())
-    host = parsed.netloc.lower().removeprefix("www.")
-    path = parsed.path.rstrip("/") or ""
-    query = "&".join(
-        p for p in sorted(parsed.query.split("&")) if p and not _TRACKING_PARAMS.match(p)
+    host = domain_of(url)
+    path = re.sub(r"/(index|default)\.(html?|php|aspx?)$", "", parsed.path, flags=re.I)
+    path = path.rstrip("/")
+    params = sorted(
+        (k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if not _TRACKING_PARAM.match(k)
     )
+    query = urlencode(params)
     return f"{host}{path}" + (f"?{query}" if query else "")
 
 
 def normalize_name(name: str) -> str:
-    cleaned = _NAME_NOISE.sub(" ", name.lower())
+    cleaned = _NAME_NOISE.sub(" ", name.lower().replace("&", " and "))
     return re.sub(r"[^a-z0-9]+", "", cleaned)
+
+
+def is_platform(domain: str) -> bool:
+    return any(domain == p or domain.endswith("." + p) for p in PLATFORM_DOMAINS)
 
 
 def _now() -> str:
@@ -71,32 +90,46 @@ def _now() -> str:
 class LeadDatabase:
     def __init__(self, path: Path):
         self.path = Path(path)
-        self.conn = sqlite3.connect(self.path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
 
     def close(self) -> None:
         self.conn.close()
 
+    def __enter__(self) -> "LeadDatabase":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     # ---------------------------------------------------------- duplicate check
-    def is_known_url(self, url: str) -> bool:
-        row = self.conn.execute(
-            "SELECT 1 FROM leads WHERE url_key = ?", (normalize_url(url),)
-        ).fetchone()
-        return row is not None
+    def is_known(self, url: str, scope: str = "domain") -> bool:
+        """Has this prospect (by URL, or by website when scope='domain') been seen?"""
+        if self._exists("url_key = ?", normalize_url(url)):
+            return True
+        domain = domain_of(url)
+        if scope == "domain" and not is_platform(domain):
+            return self._exists("domain = ?", domain)
+        return False
 
     def is_known_name(self, name: str) -> bool:
         key = normalize_name(name)
-        if len(key) < 3:  # too short to be a meaningful identity
+        if len(key) < 4:  # too short to be a meaningful identity
             return False
-        row = self.conn.execute(
-            "SELECT 1 FROM leads WHERE name_key = ? AND status != 'rejected'", (key,)
-        ).fetchone()
-        return row is not None
+        return self._exists("name_key = ? AND status IN ('qualified', 'notified', 'contacted')", key)
+
+    def _exists(self, where: str, value: str) -> bool:
+        return self.conn.execute(f"SELECT 1 FROM leads WHERE {where} LIMIT 1", (value,)).fetchone() is not None
 
     # ------------------------------------------------------------------ writes
-    def save(self, prospect: Prospect, result: LeadScore, status: str) -> int:
-        name = result.lead_name or prospect.title
+    def save(self, prospect: Prospect, result: LeadScore, status: str) -> int | None:
+        """Insert a lead. Returns its id, or None if the URL was already stored."""
+        if status not in STATUSES:
+            raise ValueError(f"unknown status {status!r}")
+        name = result.lead_name or prospect.title or prospect.domain
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO leads
                (url, url_key, domain, name, name_key, query, score, status, reasoning,
@@ -120,7 +153,7 @@ class LeadDatabase:
             ),
         )
         self.conn.commit()
-        return cur.lastrowid
+        return cur.lastrowid if cur.rowcount else None
 
     def mark_notified(self, lead_id: int) -> None:
         self.conn.execute(
@@ -138,10 +171,13 @@ class LeadDatabase:
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------- reads
+    def get(self, lead_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM leads WHERE id = ?", (lead_id,)).fetchone()
+
     def pending_notifications(self, threshold: int) -> list[sqlite3.Row]:
         """Qualified leads above threshold whose ding failed or never ran."""
         return self.conn.execute(
-            "SELECT * FROM leads WHERE status = 'qualified' AND score >= ? ORDER BY score DESC",
+            "SELECT * FROM leads WHERE status = 'qualified' AND score >= ? ORDER BY score DESC, id",
             (threshold,),
         ).fetchall()
 
@@ -151,19 +187,27 @@ class LeadDatabase:
         if status:
             sql += " AND status = ?"
             params.append(status)
-        sql += " ORDER BY score DESC, created_at DESC"
+        sql += " ORDER BY score DESC, id DESC"
         return self.conn.execute(sql, params).fetchall()
 
-    def export_csv(self, out_path: Path, min_score: int = 1) -> int:
-        rows = self.list_leads(min_score=min_score)
+    def counts(self) -> dict[str, int]:
+        rows = self.conn.execute("SELECT status, COUNT(*) FROM leads GROUP BY status").fetchall()
+        return {status: n for status, n in rows}
+
+    def export_csv(self, out_path: Path, min_score: int = 1, status: str | None = None) -> int:
+        rows = self.list_leads(min_score=min_score, status=status)
         columns = [
             "id", "name", "url", "score", "status", "reasoning", "pain_points",
             "budget_signals", "contact_hints", "suggested_opener", "query",
             "created_at", "notified_at", "contacted_at",
         ]
-        with Path(out_path).open("w", newline="", encoding="utf-8") as fh:
+        list_columns = {"pain_points", "budget_signals", "contact_hints"}
+        with Path(out_path).open("w", newline="", encoding="utf-8-sig") as fh:  # BOM: Excel-friendly
             writer = csv.writer(fh)
             writer.writerow(columns)
             for row in rows:
-                writer.writerow([row[c] for c in columns])
+                writer.writerow(
+                    ["; ".join(json.loads(row[c] or "[]")) if c in list_columns else row[c]
+                     for c in columns]
+                )
         return len(rows)

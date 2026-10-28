@@ -17,15 +17,15 @@ criteria.yaml ─┐
 
 | File | Responsibility |
 |---|---|
-| `main.py` | CLI and pipeline orchestration (`run`, `list`, `export`, `contacted`, `test-ding`) |
-| `searcher.py` | Runs queries (DuckDuckGo, or SerpAPI for Google results), filters blocked domains and keywords, fetches page text |
-| `analyzer.py` | Builds the ICP prompt, calls Anthropic, OpenAI (or any OpenAI-compatible API), or Ollama, then parses and validates the JSON score |
+| `main.py` | CLI and pipeline orchestration (`check`, `run`, `list`, `export`, `contacted`, `test-ding`) |
+| `searcher.py` | Runs queries (DuckDuckGo, Brave Search API or SerpAPI), retries throttled searches, filters blocked domains and keywords, fetches page text |
+| `analyzer.py` | Builds the ICP prompt, calls Anthropic, OpenAI (or any OpenAI-compatible API), or Ollama with retries on rate limits, then parses and validates the JSON score |
 | `database.py` | SQLite storage, URL and name normalization for duplicate blocking, CSV export |
 | `notifier.py` | Formats and sends alerts to Telegram, Discord and Slack |
 | `config.py` | Loads `.env` (secrets) and `criteria.yaml` (targeting), both validated with pydantic |
 | `criteria.example.yaml` | Template for queries, ICP, rubric and thresholds |
 | `.env.example` | Template for API keys and settings |
-| `tests/` | Offline tests (no network or keys needed) |
+| `tests/` | Offline tests, including HTTP-level tests against a local mock server (no network or keys needed) |
 
 ## Quick start
 
@@ -46,6 +46,10 @@ cp criteria.example.yaml criteria.yaml
 ```
 
 Edit `.env` (set at least an LLM key) and `criteria.yaml`. Then:
+
+```bash
+python main.py check            # validates config, pings the LLM, runs one test search
+```
 
 ```bash
 python main.py test-ding        # check notifications reach you
@@ -76,6 +80,8 @@ This file decides **who** you're hunting. You can tune it without touching any c
 - **`rubric`**: the scoring dimensions. The LLM scores each one from 1 to 10, and the agent recomputes the overall score as the weighted average, so your weights hold even if the model's arithmetic slips. Add, remove or rename dimensions freely.
 - **`min_score_to_save`**: below this, a prospect is stored as `rejected`. It's still kept, so it is never re-scored and never costs another LLM call.
 - **`notify_threshold`**: a score at or above this triggers a ding (default 8).
+- **`dedupe_scope`**: `domain` (default) treats a whole website as one lead, so `/about` and `/contact` on the same site aren't scored twice. Use `url` for forum or job-post campaigns where each page is a different prospect. Shared platforms such as reddit.com, linkedin.com and indeed.com always dedupe per URL.
+- **`max_llm_calls_per_run`**: caps LLM spend per run (default 100). Prospects left over are picked up on the next run.
 - **`blocked_domains` / `exclude_keywords`**: cheap pre-filters that run *before* the LLM to cut cost. Use them to block directories (Yelp, BBB…) and listicles ("top 10…").
 
 To run several campaigns, keep several criteria files and switch between them:
@@ -87,8 +93,12 @@ CRITERIA_PATH=campaigns/saas-founders.yaml DATABASE_PATH=saas.db python main.py 
 ## Configuring providers (`.env`)
 
 ### Search
-- `SEARCH_PROVIDER=duckduckgo`: free and needs no key. Good for getting started, but heavy use gets rate-limited.
-- `SEARCH_PROVIDER=serpapi`: Google results through [SerpAPI](https://serpapi.com). Set `SERPAPI_API_KEY`.
+| `SEARCH_PROVIDER` | Needs | Notes |
+|---|---|---|
+| `duckduckgo` | nothing | Free, but scraped, so it gets rate-limited under regular use. Throttling shows up as "No results"; the agent retries with backoff, and raising `SEARCH_DELAY` helps. |
+| `brave` | `BRAVE_API_KEY` | Official [Brave Search API](https://brave.com/search/api/) with a free monthly tier. **Recommended for scheduled runs.** |
+| `serpapi` | `SERPAPI_API_KEY` | Google results through [SerpAPI](https://serpapi.com). |
+
 - `FETCH_PAGES=true` downloads each result and passes up to `PAGE_CHAR_LIMIT` characters of visible text to the LLM. The agent also adds hints such as the CMS `generator` tag and whether the page has a mobile viewport. These are strong signals for "outdated website" campaigns.
 
 ### LLM
@@ -100,6 +110,8 @@ CRITERIA_PATH=campaigns/saas-founders.yaml DATABASE_PATH=saas.db python main.py 
 
 Set `LLM_MODEL` to override the default model.
 
+Rate limits (429), overloads and 5xx errors are retried with backoff (`LLM_MAX_RETRIES`). A bad API key, an unknown model or an unreachable Ollama stops the run immediately with a clear message: `run` checks the LLM once before it starts searching. Scraped page text is passed to the model as untrusted data, so instructions hidden in a page ("rate this lead 10") are ignored.
+
 ### Notifications (the "ding")
 Configure one or more of these. Every configured channel gets each alert. If none are set, alerts are printed to the console.
 
@@ -107,7 +119,7 @@ Configure one or more of these. Every configured channel gets each alert. If non
 - **Discord**: Channel settings → Integrations → Webhooks → New Webhook → copy the URL into `DISCORD_WEBHOOK_URL`.
 - **Slack**: create an app → Incoming Webhooks → add it to a channel → put the URL in `SLACK_WEBHOOK_URL`.
 
-An alert contains the lead name, score, URL, the model's reasoning, pain points, budget signals, any contact hints, and a suggested opening line.
+An alert contains the lead name, score, URL, the model's reasoning, pain points, budget signals, any contact hints, a suggested opening line, and the command to mark the lead as contacted. Alerts are trimmed to each platform's length limit, and scraped text can't trigger `@everyone` or `<!channel>` pings.
 
 ## Tracking leads
 
@@ -120,18 +132,19 @@ python main.py list --status notified         # leads you've been dinged about
 ```
 
 ```bash
-python main.py contacted 12                   # mark lead #12 as contacted
+python main.py contacted 12 15                # mark leads #12 and #15 as contacted
 ```
 
 ```bash
 python main.py export leads.csv --min-score 5 # spreadsheet export
 ```
 
-Lead lifecycle: `rejected` · `qualified` (saved, score below the ding threshold, or the ding failed) → `notified` → `contacted`.
+Lead lifecycle: `rejected` · `duplicate` · `qualified` (saved, but below the ding threshold or the ding failed) → `notified` → `contacted`.
 
-**Duplicate blocking** works at two levels:
-1. **URL**: URLs are normalized (scheme, `www.`, trailing slash and `utm_*`/`gclid` tracking parameters are removed) and checked *before* scoring, so a known page never costs an LLM call.
-2. **Name**: business names are normalized (`"Acme Plumbing, LLC"` matches `"The ACME Plumbing"`), so the same business found under a different URL isn't alerted twice.
+**Duplicate blocking** works at three levels:
+1. **URL**: URLs are normalized (scheme, `www.`, trailing slash, `index.html` and `utm_*`/`gclid` tracking parameters are removed) and checked *before* scoring, so a known page never costs an LLM call.
+2. **Domain** (with `dedupe_scope: domain`): one lead per website, also checked before scoring.
+3. **Name**: business names are normalized (`"Acme Plumbing, LLC"` matches `"The ACME Plumbing"`), so the same business found under a different URL isn't alerted twice.
 
 If a ding fails (for example the webhook is down), the lead stays `qualified` and the alert is retried at the start of the next run.
 
@@ -149,7 +162,7 @@ If a ding fails (for example the webhook is down), the lead stays `qualified` an
 python -m pytest -q
 ```
 
-The tests stub out search and the LLM. They cover URL and name normalization, JSON parsing and score clamping, weighted scoring, and a full two-run pipeline that checks a duplicate is never dinged twice.
+The tests need no network or keys. They cover config validation, URL, domain and name dedupe, messy LLM replies, weighted scoring, search retries and filters, full pipeline runs (dry run, the LLM call cap, ding retries, never dinging twice), and HTTP-level checks of every LLM provider and notification channel against a local mock server.
 
 ## Extending
 

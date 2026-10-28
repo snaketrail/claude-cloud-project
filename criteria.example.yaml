@@ -54,6 +54,14 @@ rubric:
 min_score_to_save: 5    # below this a prospect is stored as 'rejected' (still blocks re-scoring)
 notify_threshold: 8     # score >= this triggers a ding
 
+# domain: one lead per website, so /about and /contact aren't scored twice (businesses)
+# url:    every page is its own lead (forum threads, job posts)
+# Shared platforms (reddit.com, linkedin.com, indeed.com, ...) always dedupe per URL.
+dedupe_scope: domain
+
+# Safety cap on LLM spend per run. Leftover prospects are picked up next run.
+max_llm_calls_per_run: 100
+
 # Never consider results from these domains (subdomains included).
 blocked_domains:
   - yelp.com
@@ -66,9 +74,29 @@ blocked_domains:
   - nextdoor.com
   - mapquest.com
   - wikipedia.org
+  - consumeraffairs.com
+  - expertise.com
+  - threebestrated.com
+  - porch.com
+  - houzz.com
+  - bark.com
+  - manta.com
+  - chamberofcommerce.com
+  - yahoo.com
+  - reddit.com
+  - youtube.com
+  - linkedin.com
+  - indeed.com
 
 # Drop results whose title/snippet contains any of these (case-insensitive).
+# Listicles and directories are the most common false positives.
 exclude_keywords:
   - "top 10"
-  - "best plumbers in"
+  - "best plumbers"
+  - "best roofers"
+  - "best hvac"
+  - "according to locals"
+  - "guide)"
+  - "reviews of"
   - franchise opportunity
+  - "jobs in"
